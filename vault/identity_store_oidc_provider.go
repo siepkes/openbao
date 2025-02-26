@@ -1934,231 +1934,244 @@ func (i *IdentityStore) pathOIDCToken(ctx context.Context, req *logical.Request,
 		return tokenResponse(nil, ErrTokenInvalidRequest, "provider not found")
 	}
 
-	// client_secret_basic - Check for client credentials in the Authorization header
-	clientID, clientSecret, okBasicAuth := basicAuth(req)
-	if !okBasicAuth {
-		// client_secret_post - Check for client credentials in the request body
-		clientID = d.Get("client_id").(string)
-		if clientID == "" {
-			return tokenResponse(nil, ErrTokenInvalidRequest, "client_id parameter is required")
-		}
-		clientSecret = d.Get("client_secret").(string)
-	}
-	client, err := i.clientByID(ctx, req.Storage, clientID)
-	if err != nil {
-		return tokenResponse(nil, ErrTokenServerError, err.Error())
-	}
-	if client == nil {
-		i.Logger().Debug("client failed to authenticate with client not found", "client_id", clientID)
-		return tokenResponse(nil, ErrTokenInvalidClient, "client failed to authenticate")
-	}
-
-	// Authenticate the client if it's a confidential client type.
-	// Details at https://openid.net/specs/openid-connect-core-1_0.html#ClientAuthentication
-	if client.Type == confidential &&
-		subtle.ConstantTimeCompare([]byte(client.ClientSecret), []byte(clientSecret)) == 0 {
-		i.Logger().Debug("client failed to authenticate with invalid client secret", "client_id", clientID)
-		return tokenResponse(nil, ErrTokenInvalidClient, "client failed to authenticate")
-	}
-
-	// Validate that the client is authorized to use the provider
-	if !provider.allowedClientID(clientID) {
-		return tokenResponse(nil, ErrTokenInvalidClient, "client is not authorized to use the provider")
-	}
-
-	// Get the key that the client uses to sign ID tokens
-	key, err := i.getNamedKey(ctx, req.Storage, client.Key)
-	if err != nil {
-		return tokenResponse(nil, ErrTokenServerError, err.Error())
-	}
-	if key == nil {
-		return tokenResponse(nil, ErrTokenServerError, fmt.Sprintf("client key %q not found", client.Key))
-	}
-
-	// Validate that the client is authorized to use the key
-	if !strutil.StrListContains(key.AllowedClientIDs, "*") &&
-		!strutil.StrListContains(key.AllowedClientIDs, clientID) {
-		return tokenResponse(nil, ErrTokenInvalidClient, "client is not authorized to use the key")
-	}
-
 	// Validate the grant type
 	grantType := d.Get("grant_type").(string)
 	if grantType == "" {
 		return tokenResponse(nil, ErrTokenInvalidRequest, "grant_type parameter is required")
 	}
-	if grantType != "authorization_code" {
+	if grantType != "authorization_code" && grantType != "client_credentials" {
 		return tokenResponse(nil, ErrTokenUnsupportedGrantType, "unsupported grant_type value")
 	}
 
-	// Validate the authorization code
-	code := d.Get("code").(string)
-	if code == "" {
-		return tokenResponse(nil, ErrTokenInvalidRequest, "code parameter is required")
-	}
-
-	// Get the authorization code entry and defer its deletion (single use)
-	authCodeEntryRaw, ok, err := i.oidcAuthCodeCache.Get(ns, code)
-	defer i.oidcAuthCodeCache.Delete(ns, code)
-	if err != nil {
-		return tokenResponse(nil, ErrTokenServerError, err.Error())
-	}
-	if !ok {
-		return tokenResponse(nil, ErrTokenInvalidGrant, "authorization grant is invalid or expired")
-	}
-	authCodeEntry, ok := authCodeEntryRaw.(*authCodeCacheEntry)
-	if !ok {
-		return tokenResponse(nil, ErrTokenServerError, "authorization grant is invalid or expired")
-	}
-
-	// Ensure the authorization code was issued to the authenticated client
-	if authCodeEntry.clientID != clientID {
-		return tokenResponse(nil, ErrTokenInvalidGrant, "authorization code was not issued to the client")
-	}
-
-	// Ensure the authorization code was issued by the provider
-	if authCodeEntry.provider != name {
-		return tokenResponse(nil, ErrTokenInvalidGrant, "authorization code was not issued by the provider")
-	}
-
-	// Ensure the redirect_uri parameter value is identical to the redirect_uri
-	// parameter value that was included in the initial authorization request.
-	redirectURI := d.Get("redirect_uri").(string)
-	if redirectURI == "" {
-		return tokenResponse(nil, ErrTokenInvalidRequest, "redirect_uri parameter is required")
-	}
-	if authCodeEntry.redirectURI != redirectURI {
-		return tokenResponse(nil, ErrTokenInvalidGrant, "redirect_uri does not match the redirect_uri used in the authorization request")
-	}
-
-	// Get the entity associated with the initial authorization request
-	entity, err := i.MemDBEntityByID(authCodeEntry.entityID, true)
-	if err != nil {
-		return tokenResponse(nil, ErrTokenServerError, err.Error())
-	}
-	if entity == nil {
-		return tokenResponse(nil, ErrTokenInvalidRequest, "identity entity associated with the request not found")
-	}
-
-	// Validate that the entity is a member of the client's assignments
-	isMember, err := i.entityHasAssignment(ctx, req.Storage, entity, client.Assignments)
-	if err != nil {
-		return tokenResponse(nil, ErrTokenServerError, err.Error())
-	}
-	if !isMember {
-		return tokenResponse(nil, ErrTokenInvalidRequest, "identity entity not authorized by client assignment")
-	}
-
-	// Validate the PKCE code verifier. See details at
-	// https://datatracker.ietf.org/doc/html/rfc7636#section-4.6.
-	usedPKCE := authCodeUsedPKCE(authCodeEntry)
-	codeVerifier := d.Get("code_verifier").(string)
-	switch {
-	case !usedPKCE && client.Type == public:
-		return tokenResponse(nil, ErrTokenInvalidRequest, "PKCE is required for public clients")
-	case !usedPKCE && codeVerifier != "":
-		return tokenResponse(nil, ErrTokenInvalidRequest, "unexpected code_verifier for token exchange")
-	case usedPKCE && codeVerifier == "":
-		return tokenResponse(nil, ErrTokenInvalidRequest, "expected code_verifier for token exchange")
-	case usedPKCE:
-		codeChallenge, err := computeCodeChallenge(codeVerifier, authCodeEntry.codeChallengeMethod)
+	if grantType != "authorization_code" {
+		// client_secret_basic - Check for client credentials in the Authorization header
+		clientID, clientSecret, okBasicAuth := basicAuth(req)
+		if !okBasicAuth {
+			// client_secret_post - Check for client credentials in the request body
+			clientID = d.Get("client_id").(string)
+			if clientID == "" {
+				return tokenResponse(nil, ErrTokenInvalidRequest, "client_id parameter is required")
+			}
+			clientSecret = d.Get("client_secret").(string)
+		}
+		client, err := i.clientByID(ctx, req.Storage, clientID)
 		if err != nil {
 			return tokenResponse(nil, ErrTokenServerError, err.Error())
 		}
-
-		if subtle.ConstantTimeCompare([]byte(codeChallenge), []byte(authCodeEntry.codeChallenge)) == 0 {
-			return tokenResponse(nil, ErrTokenInvalidGrant, "invalid code_verifier for token exchange")
+		if client == nil {
+			i.Logger().Debug("client failed to authenticate with client not found", "client_id", clientID)
+			return tokenResponse(nil, ErrTokenInvalidClient, "client failed to authenticate")
 		}
-	}
 
-	// The access token is a Vault batch token with a policy that only
-	// provides access to the issuing provider's userinfo endpoint.
-	accessTokenIssuedAt := time.Now()
-	accessTokenExpiry := accessTokenIssuedAt.Add(client.AccessTokenTTL)
-	accessToken := &logical.TokenEntry{
-		Type:               logical.TokenTypeBatch,
-		NamespaceID:        ns.ID,
-		Path:               req.Path,
-		TTL:                client.AccessTokenTTL,
-		CreationTime:       accessTokenIssuedAt.Unix(),
-		EntityID:           entity.ID,
-		NoIdentityPolicies: true,
-		Meta: map[string]string{
-			"oidc_token_type": "access token",
-		},
-		InternalMeta: map[string]string{
-			accessTokenClientIDMeta: client.ClientID,
-			accessTokenScopesMeta:   strings.Join(authCodeEntry.scopes, scopesDelimiter),
-		},
-		InlinePolicy: fmt.Sprintf(`
+		// Authenticate the client if it's a confidential client type.
+		// Details at https://openid.net/specs/openid-connect-core-1_0.html#ClientAuthentication
+		if client.Type == confidential &&
+			subtle.ConstantTimeCompare([]byte(client.ClientSecret), []byte(clientSecret)) == 0 {
+			i.Logger().Debug("client failed to authenticate with invalid client secret", "client_id", clientID)
+			return tokenResponse(nil, ErrTokenInvalidClient, "client failed to authenticate")
+		}
+
+		// Validate that the client is authorized to use the provider
+		if !provider.allowedClientID(clientID) {
+			return tokenResponse(nil, ErrTokenInvalidClient, "client is not authorized to use the provider")
+		}
+
+		// Get the key that the client uses to sign ID tokens
+		key, err := i.getNamedKey(ctx, req.Storage, client.Key)
+		if err != nil {
+			return tokenResponse(nil, ErrTokenServerError, err.Error())
+		}
+		if key == nil {
+			return tokenResponse(nil, ErrTokenServerError, fmt.Sprintf("client key %q not found", client.Key))
+		}
+
+		// Validate that the client is authorized to use the key
+		if !strutil.StrListContains(key.AllowedClientIDs, "*") &&
+			!strutil.StrListContains(key.AllowedClientIDs, clientID) {
+			return tokenResponse(nil, ErrTokenInvalidClient, "client is not authorized to use the key")
+		}
+
+		// Validate the authorization code
+		code := d.Get("code").(string)
+		if code == "" {
+			return tokenResponse(nil, ErrTokenInvalidRequest, "code parameter is required")
+		}
+
+		// Get the authorization code entry and defer its deletion (single use)
+		authCodeEntryRaw, ok, err := i.oidcAuthCodeCache.Get(ns, code)
+		defer i.oidcAuthCodeCache.Delete(ns, code)
+		if err != nil {
+			return tokenResponse(nil, ErrTokenServerError, err.Error())
+		}
+		if !ok {
+			return tokenResponse(nil, ErrTokenInvalidGrant, "authorization grant is invalid or expired")
+		}
+		authCodeEntry, ok := authCodeEntryRaw.(*authCodeCacheEntry)
+		if !ok {
+			return tokenResponse(nil, ErrTokenServerError, "authorization grant is invalid or expired")
+		}
+
+		// Ensure the authorization code was issued to the authenticated client
+		if authCodeEntry.clientID != clientID {
+			return tokenResponse(nil, ErrTokenInvalidGrant, "authorization code was not issued to the client")
+		}
+
+		// Ensure the authorization code was issued by the provider
+		if authCodeEntry.provider != name {
+			return tokenResponse(nil, ErrTokenInvalidGrant, "authorization code was not issued by the provider")
+		}
+
+		// Ensure the redirect_uri parameter value is identical to the redirect_uri
+		// parameter value that was included in the initial authorization request.
+		redirectURI := d.Get("redirect_uri").(string)
+		if redirectURI == "" {
+			return tokenResponse(nil, ErrTokenInvalidRequest, "redirect_uri parameter is required")
+		}
+		if authCodeEntry.redirectURI != redirectURI {
+			return tokenResponse(nil, ErrTokenInvalidGrant, "redirect_uri does not match the redirect_uri used in the authorization request")
+		}
+
+		// Get the entity associated with the initial authorization request
+		entity, err := i.MemDBEntityByID(authCodeEntry.entityID, true)
+		if err != nil {
+			return tokenResponse(nil, ErrTokenServerError, err.Error())
+		}
+		if entity == nil {
+			return tokenResponse(nil, ErrTokenInvalidRequest, "identity entity associated with the request not found")
+		}
+
+		// Validate that the entity is a member of the client's assignments
+		isMember, err := i.entityHasAssignment(ctx, req.Storage, entity, client.Assignments)
+		if err != nil {
+			return tokenResponse(nil, ErrTokenServerError, err.Error())
+		}
+		if !isMember {
+			return tokenResponse(nil, ErrTokenInvalidRequest, "identity entity not authorized by client assignment")
+		}
+
+		// Validate the PKCE code verifier. See details at
+		// https://datatracker.ietf.org/doc/html/rfc7636#section-4.6.
+		usedPKCE := authCodeUsedPKCE(authCodeEntry)
+		codeVerifier := d.Get("code_verifier").(string)
+		switch {
+		case !usedPKCE && client.Type == public:
+			return tokenResponse(nil, ErrTokenInvalidRequest, "PKCE is required for public clients")
+		case !usedPKCE && codeVerifier != "":
+			return tokenResponse(nil, ErrTokenInvalidRequest, "unexpected code_verifier for token exchange")
+		case usedPKCE && codeVerifier == "":
+			return tokenResponse(nil, ErrTokenInvalidRequest, "expected code_verifier for token exchange")
+		case usedPKCE:
+			codeChallenge, err := computeCodeChallenge(codeVerifier, authCodeEntry.codeChallengeMethod)
+			if err != nil {
+				return tokenResponse(nil, ErrTokenServerError, err.Error())
+			}
+
+			if subtle.ConstantTimeCompare([]byte(codeChallenge), []byte(authCodeEntry.codeChallenge)) == 0 {
+				return tokenResponse(nil, ErrTokenInvalidGrant, "invalid code_verifier for token exchange")
+			}
+		}
+
+		// The access token is a Vault batch token with a policy that only
+		// provides access to the issuing provider's userinfo endpoint.
+		accessTokenIssuedAt := time.Now()
+		accessTokenExpiry := accessTokenIssuedAt.Add(client.AccessTokenTTL)
+		accessToken := &logical.TokenEntry{
+			Type:               logical.TokenTypeBatch,
+			NamespaceID:        ns.ID,
+			Path:               req.Path,
+			TTL:                client.AccessTokenTTL,
+			CreationTime:       accessTokenIssuedAt.Unix(),
+			EntityID:           entity.ID,
+			NoIdentityPolicies: true,
+			Meta: map[string]string{
+				"oidc_token_type": "access token",
+			},
+			InternalMeta: map[string]string{
+				accessTokenClientIDMeta: client.ClientID,
+				accessTokenScopesMeta:   strings.Join(authCodeEntry.scopes, scopesDelimiter),
+			},
+			InlinePolicy: fmt.Sprintf(`
 			path "identity/oidc/provider/%s/userinfo" {
 				capabilities = ["read", "update"]
 			}
 		`, name),
-	}
-	err = i.tokenStorer.CreateToken(ctx, accessToken)
-	if err != nil {
-		return tokenResponse(nil, ErrTokenServerError, err.Error())
-	}
+		}
+		err = i.tokenStorer.CreateToken(ctx, accessToken)
+		if err != nil {
+			return tokenResponse(nil, ErrTokenServerError, err.Error())
+		}
 
-	// Compute the access token hash claim (at_hash)
-	atHash, err := computeHashClaim(key.Algorithm, accessToken.ID)
-	if err != nil {
-		return tokenResponse(nil, ErrTokenServerError, err.Error())
-	}
+		// Compute the access token hash claim (at_hash)
+		atHash, err := computeHashClaim(key.Algorithm, accessToken.ID)
+		if err != nil {
+			return tokenResponse(nil, ErrTokenServerError, err.Error())
+		}
 
-	// Compute the authorization code hash claim (c_hash)
-	cHash, err := computeHashClaim(key.Algorithm, code)
-	if err != nil {
-		return tokenResponse(nil, ErrTokenServerError, err.Error())
-	}
+		// Compute the authorization code hash claim (c_hash)
+		cHash, err := computeHashClaim(key.Algorithm, code)
+		if err != nil {
+			return tokenResponse(nil, ErrTokenServerError, err.Error())
+		}
 
-	// Set the ID token claims
-	idTokenIssuedAt := time.Now()
-	idTokenExpiry := idTokenIssuedAt.Add(client.IDTokenTTL)
-	idToken := idToken{
-		Namespace:       ns.ID,
-		Issuer:          provider.effectiveIssuer,
-		Subject:         authCodeEntry.entityID,
-		Audience:        authCodeEntry.clientID,
-		Nonce:           authCodeEntry.nonce,
-		Expiry:          idTokenExpiry.Unix(),
-		IssuedAt:        idTokenIssuedAt.Unix(),
-		AccessTokenHash: atHash,
-		CodeHash:        cHash,
-	}
+		// Set the ID token claims
+		idTokenIssuedAt := time.Now()
+		idTokenExpiry := idTokenIssuedAt.Add(client.IDTokenTTL)
+		idToken := idToken{
+			Namespace:       ns.ID,
+			Issuer:          provider.effectiveIssuer,
+			Subject:         authCodeEntry.entityID,
+			Audience:        authCodeEntry.clientID,
+			Nonce:           authCodeEntry.nonce,
+			Expiry:          idTokenExpiry.Unix(),
+			IssuedAt:        idTokenIssuedAt.Unix(),
+			AccessTokenHash: atHash,
+			CodeHash:        cHash,
+		}
 
-	// Add the auth_time claim if it's not the zero time instant
-	if !authCodeEntry.authTime.IsZero() {
-		idToken.AuthTime = authCodeEntry.authTime.Unix()
-	}
+		// Add the auth_time claim if it's not the zero time instant
+		if !authCodeEntry.authTime.IsZero() {
+			idToken.AuthTime = authCodeEntry.authTime.Unix()
+		}
 
-	// Populate each of the requested scope templates
-	templates, conflict, err := i.populateScopeTemplates(ctx, req.Storage, ns, entity, authCodeEntry.scopes...)
-	if !conflict && err != nil {
-		return tokenResponse(nil, ErrTokenServerError, err.Error())
-	}
-	if conflict && err != nil {
-		return tokenResponse(nil, ErrTokenInvalidRequest, err.Error())
-	}
+		// Populate each of the requested scope templates
+		templates, conflict, err := i.populateScopeTemplates(ctx, req.Storage, ns, entity, authCodeEntry.scopes...)
+		if !conflict && err != nil {
+			return tokenResponse(nil, ErrTokenServerError, err.Error())
+		}
+		if conflict && err != nil {
+			return tokenResponse(nil, ErrTokenInvalidRequest, err.Error())
+		}
 
-	// Generate the ID token payload
-	payload, err := idToken.generatePayload(i.Logger(), templates...)
-	if err != nil {
-		return tokenResponse(nil, ErrTokenServerError, err.Error())
-	}
+		// Generate the ID token payload
+		payload, err := idToken.generatePayload(i.Logger(), templates...)
+		if err != nil {
+			return tokenResponse(nil, ErrTokenServerError, err.Error())
+		}
 
-	// Sign the ID token using the client's key
-	signedIDToken, err := key.signPayload(payload)
-	if err != nil {
-		return tokenResponse(nil, ErrTokenServerError, err.Error())
-	}
+		// Sign the ID token using the client's key
+		signedIDToken, err := key.signPayload(payload)
+		if err != nil {
+			return tokenResponse(nil, ErrTokenServerError, err.Error())
+		}
 
-	return tokenResponse(map[string]interface{}{
-		"token_type":   "Bearer",
-		"access_token": accessToken.ID,
-		"id_token":     signedIDToken,
-		"expires_in":   int64(accessTokenExpiry.Sub(accessTokenIssuedAt).Seconds()),
-	}, "", "")
+		return tokenResponse(map[string]interface{}{
+			"token_type":   "Bearer",
+			"access_token": accessToken.ID,
+			"id_token":     signedIDToken,
+			"expires_in":   int64(accessTokenExpiry.Sub(accessTokenIssuedAt).Seconds()),
+		}, "", "")
+	} else if grantType != "client_credentials" {
+		// Extract the client_id and client_secret from POST body.
+		clientID := d.Get("client_id").(string)
+		if clientID == "" {
+			return tokenResponse(nil, ErrTokenInvalidRequest, "client_id parameter is required")
+		}
+		clientSecret := d.Get("client_secret").(string)
+		if clientSecret == "" {
+			return tokenResponse(nil, ErrTokenInvalidRequest, "client_secret parameter is required")
+		}
+
+	}
 }
 
 // tokenResponse returns the OIDC Token Response. An error response is

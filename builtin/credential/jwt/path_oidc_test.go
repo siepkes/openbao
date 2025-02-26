@@ -1457,6 +1457,8 @@ func (o *oidcProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		grant_type := r.FormValue("grant_type")
 		if grant_type == "urn:ietf:params:oauth:grant-type:device_code" {
 			code = r.FormValue("device_code")
+		} else if grant_type == "client_credentials" {
+			code = r.FormValue("client_credentials")
 		} else {
 			code = r.FormValue("code")
 		}
